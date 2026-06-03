@@ -1,4 +1,4 @@
-# omp-extension-mode
+# @yuechou/omp-mode
 
 Oh My Pi Mode + Skill + Extension Management System.
 
@@ -6,21 +6,12 @@ Ported from [pi-mode](https://github.com/yuechouu/pi-mode) for Oh My Pi compatib
 
 ## 安装
 
-在 omp settings 中添加扩展路径：
-
-```json
-// ~/.omp/agent/settings.json
-{
-  "extensions": [
-    "D:/workplace/my-agent-memory/extensions/omp-mode"
-  ]
-}
-```
-
-或命令行：
-
 ```bash
-omp -e D:/workplace/my-agent-memory/extensions/omp-mode
+# npm
+npm install -g @yuechou/omp-mode
+
+# omp
+omp install @yuechou/omp-mode
 ```
 
 ## 配置
@@ -37,7 +28,7 @@ omp -e D:/workplace/my-agent-memory/extensions/omp-mode
 ```bash
 # 使用自定义目录
 export PI_CODING_AGENT_DIR="/opt/omp/agent"
-omp -e D:/workplace/my-agent-memory/extensions/omp-mode
+omp -e @yuechou/omp-mode
 ```
 
 ## 功能
@@ -154,3 +145,8 @@ pi.events.on("mode_changed", (data) => {
 ├── skills/           ← 全局技能
 └── extensions/       ← 全局扩展
 ```
+
+## 相关链接
+
+- [pi-mode](https://github.com/yuechouu/pi-mode) - Pi 版本
+- [@yuechou/omp-memory](https://www.npmjs.com/package/@yuechou/omp-memory) - 记忆系统
