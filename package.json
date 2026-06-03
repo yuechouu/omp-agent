@@ -1,0 +1,12 @@
+{
+  "name": "@yuechou/omp-mode",
+  "version": "1.0.0",
+  "description": "Oh My Pi mode, skill, and extension management system",
+  "main": "index.ts",
+  "keywords": ["omp-extension", "mode", "skill", "extension", "management"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yuechouu/my-agent-memory"
+  }
+}
