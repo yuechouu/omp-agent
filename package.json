@@ -1,12 +1,22 @@
 {
   "name": "@yuechou/omp-agent",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "Oh My Pi multi-agent management extension",
   "main": "index.ts",
-  "keywords": ["omp-extension", "agent", "multi-agent", "management"],
+  "keywords": [
+    "omp-extension",
+    "agent",
+    "multi-agent",
+    "management"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/yuechouu/omp-agent"
+  },
+  "omp": {
+    "extensions": [
+      "index.ts"
+    ]
   }
 }

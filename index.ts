@@ -472,162 +472,210 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
     return true;
   }
 
-  // ── /agent Command ──────────────────────────────────────
+  // ── /agent-list Command ─────────────────────────────────
+
+  pi.registerCommand("agent-list", {
+    description: "List all agents with their configurations",
+    handler: async (_args, ctx) => {
+      const agents = listAgents();
+      const lines = ["Available agents:", ""];
+      for (const name of agents) {
+        const cfg = loadAgentConfig(name);
+        const marker = name === currentAgent ? " ◀" : "";
+        const desc = cfg?.description || "";
+        const model = cfg?.model || "inherit";
+        const thinking = cfg?.thinking || "inherit";
+        const tools = cfg?.tools ? cfg.tools.length + " tools" : "all";
+        lines.push(`  ${ctx.ui.theme.fg("accent", name)}${marker}`);
+        lines.push(`    ${desc}`);
+        lines.push(`    model: ${model} | thinking: ${thinking} | tools: ${tools}`);
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  // ── /agent Command (switch via selector) ───────────────
 
   pi.registerCommand("agent", {
-    description: "Switch, list, create, edit, or delete agents",
-    argumentHint: "[name | list | create <name> | edit | delete <name>]",
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(/\s+/);
-      const action = parts[0]?.toLowerCase();
-
-      // No args → show current agent + list
-      if (!action) {
-        const agents = listAgents();
-        const config = loadAgentConfig(currentAgent);
-        const lines = [
-          `Current agent: ${ctx.ui.theme.bold(currentAgent)}`,
-          config?.description ? `  ${config.description}` : "",
-          config?.model ? `  Model: ${config.model}` : "",
-          config?.thinking ? `  Thinking: ${config.thinking}` : "",
-          config?.tools ? `  Tools: ${config.tools.join(", ")}` : "",
-          "",
-          "Available agents:",
-          "",
-        ];
-        for (const name of agents) {
-          const marker = name === currentAgent ? " ◀" : "";
-          const cfg = loadAgentConfig(name);
-          const desc = cfg?.description ? ` — ${cfg.description}` : "";
-          lines.push(`  ${ctx.ui.theme.fg("accent", name)}${desc}${marker}`);
-        }
-        ctx.ui.notify(lines.filter(Boolean).join("\n"), "info");
+    description: "Switch to a different agent",
+    handler: async (_args, ctx) => {
+      const agents = listAgents();
+      if (agents.length === 0) {
+        ctx.ui.notify("No agents found. Use /agent-create to create one.", "error");
         return;
       }
 
-      // /agent list
-      if (action === "list") {
-        const agents = listAgents();
-        const lines = ["Available agents:", ""];
-        for (const name of agents) {
-          const cfg = loadAgentConfig(name);
-          const marker = name === currentAgent ? " ◀" : "";
-          const desc = cfg?.description || "";
-          const model = cfg?.model || "inherit";
-          const thinking = cfg?.thinking || "inherit";
-          const tools = cfg?.tools ? cfg.tools.length + " tools" : "all";
-          lines.push(`  ${ctx.ui.theme.fg("accent", name)}${marker}`);
-          lines.push(`    ${desc}`);
-          lines.push(`    model: ${model} | thinking: ${thinking} | tools: ${tools}`);
-        }
-        ctx.ui.notify(lines.join("\n"), "info");
-        return;
-      }
-
-      // /agent create <name>
-      if (action === "create") {
-        const name = parts[1]?.toLowerCase();
-        if (!name) {
-          ctx.ui.notify("Usage: /agent create <name>", "error");
-          return;
-        }
-        if (listAgents().includes(name)) {
-          ctx.ui.notify(`Agent "${name}" already exists.`, "error");
-          return;
-        }
-
-        // Interactive setup
-        const description = await ctx.ui.input("Agent description:", "A helpful assistant") ?? "";
-        const model = await ctx.ui.input("Model (empty for inherit):", "") ?? "";
-        const thinking = await ctx.ui.select("Thinking level:", [
-          "inherit", "minimal", "low", "medium", "high", "xhigh",
-        ]) ?? "inherit";
-
-        const config: AgentConfig = {
-          name,
-          description: description || undefined,
-          model: model || undefined,
-          thinking: thinking === "inherit" ? undefined : thinking,
-          tools: undefined, // inherit all
-          goals: [],
-          constraints: [],
+      // Build selector options with config summary
+      const options = agents.map(name => {
+        const cfg = loadAgentConfig(name);
+        const desc = cfg?.description || "";
+        const model = cfg?.model || "inherit";
+        const thinking = cfg?.thinking || "inherit";
+        const marker = name === currentAgent ? " (current)" : "";
+        return {
+          label: `${name}${marker}`,
+          description: `${desc} | model: ${model} | thinking: ${thinking}`,
         };
+      });
 
-        saveAgentConfig(config);
-        fs.writeFileSync(getAgentSystemPromptPath(name),
-          `# ${name} Agent\n\nYou are a helpful assistant.\n`,
-          "utf-8"
-        );
+      const selected = await ctx.ui.select("Select agent:", options);
+      if (!selected) return;
 
-        ctx.ui.notify(`Created agent "${name}" at ${getAgentDir(name)}`, "success");
-        ctx.ui.notify(`Edit ${getAgentConfigPath(name)} to customize.`, "info");
-        return;
-      }
-
-      // /agent edit
-      if (action === "edit") {
-        const configPath = getAgentConfigPath(currentAgent);
-        const systemPath = getAgentSystemPromptPath(currentAgent);
-        ctx.ui.notify(`Config: ${configPath}`, "info");
-        ctx.ui.notify(`Prompt: ${systemPath}`, "info");
-        return;
-      }
-
-      // /agent delete <name>
-      if (action === "delete") {
-        const name = parts[1]?.toLowerCase();
-        if (!name) {
-          ctx.ui.notify("Usage: /agent delete <name>", "error");
-          return;
-        }
-        if (name === currentAgent) {
-          ctx.ui.notify("Cannot delete the active agent.", "error");
-          return;
-        }
-        if (!listAgents().includes(name)) {
-          ctx.ui.notify(`Agent "${name}" not found.`, "error");
-          return;
-        }
-
-        const confirmed = await ctx.ui.confirm("Delete agent", `Delete agent "${name}" and all its files?`);
-        if (confirmed) {
-          deleteAgent(name);
-          ctx.ui.notify(`Deleted agent "${name}".`, "success");
-        }
-        return;
-      }
-
-      // /agent switch <name> — or just /agent <name>
-      const target = action === "switch" ? (parts[1]?.toLowerCase() ?? "") : action;
-      if (!target) {
-        ctx.ui.notify("Usage: /agent switch <name> or /agent <name>", "error");
-        return;
-      }
-
-      if (!listAgents().includes(target)) {
-        ctx.ui.notify(`Agent "${target}" not found. Use /agent list to see available agents.`, "error");
-        return;
-      }
-
+      // Extract agent name (strip " (current)" suffix)
+      const target = selected.replace(/ \(current\)$/, "");
       if (target === currentAgent) {
         ctx.ui.notify(`Already on agent "${target}".`, "info");
         return;
       }
 
-      // Show agent summary and ask about history
-      const config = loadAgentConfig(target);
-      const summary = [
-        `Agent: ${target}`,
-        config?.description ? `  ${config.description}` : "",
-        config?.model ? `  Model: ${config.model}` : "",
-        config?.thinking ? `  Thinking: ${config.thinking}` : "",
-        config?.tools ? `  Tools: ${config.tools.join(", ")}` : "",
-      ].filter(Boolean).join("\n");
-
-      ctx.ui.notify(summary, "info");
+      // Ask about history
       const clearHistory = await ctx.ui.confirm("Switch agent", "Clear conversation history?");
-
       await switchAgent(target, ctx, clearHistory ?? false);
+    },
+  });
+
+  // ── /agent-create Command ─────────────────────────────
+
+  pi.registerCommand("agent-create", {
+    description: "Create a new agent interactively",
+    handler: async (_args, ctx) => {
+      // Step 1: Name
+      const name = await ctx.ui.input("Agent name:", "my-agent");
+      if (!name) return;
+      const normalizedName = name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+      if (listAgents().includes(normalizedName)) {
+        ctx.ui.notify(`Agent "${normalizedName}" already exists.`, "error");
+        return;
+      }
+
+      // Step 2: Description
+      const description = await ctx.ui.input("Description:", "A helpful assistant");
+
+      // Step 3: Model
+      const modelOptions = [
+        { label: "(inherit)", description: "Use the current session model" },
+        { label: "anthropic/claude-sonnet-4-6", description: "Claude Sonnet 4.6" },
+        { label: "anthropic/claude-opus-4-8", description: "Claude Opus 4.8" },
+        { label: "anthropic/claude-haiku-4-5", description: "Claude Haiku 4.5" },
+      ];
+      const model = await ctx.ui.select("Model:", modelOptions);
+      if (model === undefined) return;
+
+      // Step 4: Thinking level
+      const thinkingOptions = [
+        { label: "(inherit)", description: "Use the current thinking level" },
+        { label: "minimal", description: "~1k tokens" },
+        { label: "low", description: "~2k tokens" },
+        { label: "medium", description: "~8k tokens" },
+        { label: "high", description: "~16k tokens" },
+        { label: "xhigh", description: "~32k tokens" },
+      ];
+      const thinking = await ctx.ui.select("Thinking level:", thinkingOptions);
+      if (thinking === undefined) return;
+
+      // Step 5: Tools
+      const toolPresets = [
+        { label: "all", description: "All available tools" },
+        { label: "coding", description: "read, write, edit, bash, grep, find, ls, lsp, search, task" },
+        { label: "research", description: "read, grep, find, ls, search, lsp (read-only)" },
+        { label: "custom...", description: "Enter tool names manually" },
+      ];
+      const toolChoice = await ctx.ui.select("Tools:", toolPresets);
+      if (toolChoice === undefined) return;
+
+      let tools: string[] | undefined;
+      if (toolChoice === "all") {
+        tools = undefined;
+      } else if (toolChoice === "coding") {
+        tools = ["read", "write", "edit", "bash", "grep", "find", "ls", "lsp", "search", "task"];
+      } else if (toolChoice === "research") {
+        tools = ["read", "grep", "find", "ls", "search", "lsp"];
+      } else {
+        const customTools = await ctx.ui.input("Tools (comma-separated):", "read, write, edit, bash");
+        if (customTools) {
+          tools = customTools.split(",").map(t => t.trim()).filter(Boolean);
+        }
+      }
+
+      // Create agent
+      const config: AgentConfig = {
+        name: normalizedName,
+        description: description || undefined,
+        model: model === "(inherit)" ? undefined : model,
+        thinking: thinking === "(inherit)" ? undefined : thinking,
+        tools,
+        goals: [],
+        constraints: [],
+      };
+
+      saveAgentConfig(config);
+      fs.writeFileSync(getAgentSystemPromptPath(normalizedName),
+        `# ${normalizedName} Agent\n\nYou are a helpful assistant.\n`,
+        "utf-8"
+      );
+
+      ctx.ui.notify(`Created agent "${normalizedName}"`, "success");
+
+      // Ask to switch
+      const doSwitch = await ctx.ui.confirm("Switch now?", `Switch to the new agent "${normalizedName}"?`);
+      if (doSwitch) {
+        await switchAgent(normalizedName, ctx, false);
+      }
+    },
+  });
+
+  // ── /agent-edit Command ───────────────────────────────
+
+  pi.registerCommand("agent-edit", {
+    description: "Edit an agent's configuration or system prompt",
+    handler: async (_args, ctx) => {
+      const agents = listAgents();
+      if (agents.length === 0) {
+        ctx.ui.notify("No agents found.", "error");
+        return;
+      }
+
+      // Select agent to edit
+      const options = agents.map(name => {
+        const cfg = loadAgentConfig(name);
+        const marker = name === currentAgent ? " (current)" : "";
+        return {
+          label: `${name}${marker}`,
+          description: cfg?.description || "",
+        };
+      });
+
+      const selected = await ctx.ui.select("Select agent to edit:", options);
+      if (!selected) return;
+      const target = selected.replace(/ \(current\)$/, "");
+
+      // Choose what to edit
+      const action = await ctx.ui.select("What to edit:", [
+        { label: "Config (agent.yml)", description: "Model, thinking, tools, goals, constraints" },
+        { label: "System prompt (system.md)", description: "The agent's system prompt" },
+      ]);
+      if (!action) return;
+
+      if (action.startsWith("Config")) {
+        const configPath = getAgentConfigPath(target);
+        ctx.ui.notify(`Edit: ${configPath}`, "info");
+        // Open in editor
+        const content = loadFile(configPath);
+        const edited = await ctx.ui.editor(`agent.yml — ${target}`, content);
+        if (edited !== undefined) {
+          fs.writeFileSync(configPath, edited, "utf-8");
+          ctx.ui.notify("Config saved. Changes apply on next turn.", "success");
+        }
+      } else {
+        const promptPath = getAgentSystemPromptPath(target);
+        ctx.ui.notify(`Edit: ${promptPath}`, "info");
+        const content = loadFile(promptPath);
+        const edited = await ctx.ui.editor(`system.md — ${target}`, content);
+        if (edited !== undefined) {
+          fs.writeFileSync(promptPath, edited, "utf-8");
+          ctx.ui.notify("System prompt saved. Changes apply on next turn.", "success");
+        }
+      }
     },
   });
 
