@@ -1,39 +1,103 @@
 /**
- * Oh My Pi Mode + Skill + Extension Management System
- *
- * Ported from pi-mode for Oh My Pi compatibility.
+ * omp-agent: Multi-Agent Management Extension for Oh My Pi
  *
  * Features:
- * - /mode command to switch modes
- * - System prompt role replacement per mode
- * - System prompt cleanup: remove inactive mode extension_context tags
- * - Skill filtering (global + all base + current mode)
- * - Tool filtering via setActiveTools() on mode switch
- * - skill_install / extension_install tools with interactive location selection
- * - isActiveForMode() helper for other extensions
- *
- * Extension Context Marking Protocol:
- *   Other extensions can wrap their system prompt injections with mode tags:
- *     <extension_context mode="coding,research">...content...</extension_context>
- *   The mode extension removes content from inactive modes on switch.
- *   mode="all" or no mode attribute = always active.
+ * - /agent command to switch, list, create, edit, delete agents
+ * - Per-agent config: model, thinking level, tools, goals, constraints
+ * - Per-agent system prompt (system.md)
+ * - agent_list / agent_switch / agent_create tools for LLM
+ * - agent_changed event for cross-extension communication
+ * - Compatible with old modes/ directory (auto-migration)
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
 // ---------------------------------------------------------------------------
-// Constants — configurable via environment variables
+// Constants
 // ---------------------------------------------------------------------------
 
-// omp 环境变量惯例：PI_CONFIG_DIR 或 PI_CODING_AGENT_DIR
 const PI_CONFIG_DIR = process.env.PI_CONFIG_DIR || ".omp";
-const OMP_AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), PI_CONFIG_DIR, "agent");
-const MODES_DIR = path.join(OMP_AGENT_DIR, "modes");
-const GLOBAL_SKILLS_DIR = path.join(OMP_AGENT_DIR, "skills");
-const GLOBAL_EXTENSIONS_DIR = path.join(OMP_AGENT_DIR, "extensions");
+const OMP_DIR = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), PI_CONFIG_DIR, "agent");
+const AGENTS_DIR = path.join(OMP_DIR, "agents");
+const LEGACY_MODES_DIR = path.join(OMP_DIR, "modes");
+const CURRENT_FILE = path.join(AGENTS_DIR, ".current");
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface AgentConfig {
+  name: string;
+  description?: string;
+  model?: string;
+  thinking?: string;
+  tools?: string[];
+  goals?: string[];
+  constraints?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// YAML Parser (minimal — handles our flat agent.yml format)
+// ---------------------------------------------------------------------------
+
+function parseYaml(text: string): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  let currentKey: string | null = null;
+  let currentList: string[] | null = null;
+
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    // Skip comments and blank lines
+    if (/^\s*#/.test(line) || /^\s*$/.test(line)) continue;
+
+    // List item
+    if (/^\s*-\s+/.test(line)) {
+      const value = line.replace(/^\s*-\s+/, "").trim().replace(/^["']|["']$/g, "");
+      if (currentKey && currentList) {
+        currentList.push(value);
+      }
+      continue;
+    }
+
+    // Flush previous list
+    if (currentKey && currentList) {
+      result[currentKey] = currentList;
+      currentKey = null;
+      currentList = null;
+    }
+
+    // Key: value pair
+    const match = line.match(/^(\w[\w-]*):\s*(.*)/);
+    if (match) {
+      const [, key, rawValue] = match;
+      const value = rawValue.trim();
+
+      // Start of a list
+      if (value === "" || value === "[]") {
+        if (value === "[]") {
+          result[key] = [];
+        } else {
+          currentKey = key;
+          currentList = [];
+        }
+        continue;
+      }
+
+      // Scalar value
+      result[key] = value.replace(/^["']|["']$/g, "");
+    }
+  }
+
+  // Flush last list
+  if (currentKey && currentList) {
+    result[currentKey] = currentList;
+  }
+
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -43,354 +107,665 @@ function ensureDir(dir: string): void {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function getModeDir(mode: string): string {
-  return path.join(MODES_DIR, mode);
-}
-function getModeAgentsFile(mode: string): string {
-  return path.join(getModeDir(mode), "agents.md");
-}
-function getModeSkillsDir(mode: string): string {
-  return path.join(getModeDir(mode), "skills");
-}
-function getModeExtensionsDir(mode: string): string {
-  return path.join(getModeDir(mode), "extensions");
-}
-
 function loadFile(filePath: string): string {
   try { return fs.readFileSync(filePath, "utf-8").trim(); }
   catch { return ""; }
 }
 
-function listModes(): string[] {
-  ensureDir(MODES_DIR);
-  return fs.readdirSync(MODES_DIR).filter((f) =>
-    fs.statSync(path.join(MODES_DIR, f)).isDirectory()
+function getAgentDir(name: string): string {
+  return path.join(AGENTS_DIR, name);
+}
+
+function getAgentConfigPath(name: string): string {
+  return path.join(getAgentDir(name), "agent.yml");
+}
+
+function getAgentSystemPromptPath(name: string): string {
+  return path.join(getAgentDir(name), "system.md");
+}
+
+function getAgentSkillsDir(name: string): string {
+  return path.join(getAgentDir(name), "skills");
+}
+
+function getAgentExtensionsDir(name: string): string {
+  return path.join(getAgentDir(name), "extensions");
+}
+
+// ---------------------------------------------------------------------------
+// Agent CRUD
+// ---------------------------------------------------------------------------
+
+function loadAgentConfig(name: string): AgentConfig | null {
+  const configPath = getAgentConfigPath(name);
+  if (!fs.existsSync(configPath)) return null;
+
+  const raw = parseYaml(loadFile(configPath));
+  return {
+    name: (raw.name as string) || name,
+    description: raw.description as string | undefined,
+    model: raw.model as string | undefined,
+    thinking: raw.thinking as string | undefined,
+    tools: raw.tools as string[] | undefined,
+    goals: raw.goals as string[] | undefined,
+    constraints: raw.constraints as string[] | undefined,
+  };
+}
+
+function saveAgentConfig(config: AgentConfig): void {
+  const dir = getAgentDir(config.name);
+  ensureDir(dir);
+
+  const lines: string[] = [`name: ${config.name}`];
+  if (config.description) lines.push(`description: "${config.description}"`);
+  if (config.model) lines.push(`model: ${config.model}`);
+  if (config.thinking) lines.push(`thinking: ${config.thinking}`);
+  if (config.tools && config.tools.length > 0) {
+    lines.push("tools:");
+    for (const t of config.tools) lines.push(`  - ${t}`);
+  }
+  if (config.goals && config.goals.length > 0) {
+    lines.push("goals:");
+    for (const g of config.goals) lines.push(`  - "${g}"`);
+  }
+  if (config.constraints && config.constraints.length > 0) {
+    lines.push("constraints:");
+    for (const c of config.constraints) lines.push(`  - "${c}"`);
+  }
+
+  fs.writeFileSync(getAgentConfigPath(config.name), lines.join("\n") + "\n", "utf-8");
+}
+
+function listAgents(): string[] {
+  ensureDir(AGENTS_DIR);
+  return fs.readdirSync(AGENTS_DIR).filter((f) => {
+    const full = path.join(AGENTS_DIR, f);
+    return fs.statSync(full).isDirectory() && !f.startsWith(".");
+  });
+}
+
+function deleteAgent(name: string): boolean {
+  const dir = getAgentDir(name);
+  if (!fs.existsSync(dir)) return false;
+  fs.rmSync(dir, { recursive: true, force: true });
+  return true;
+}
+
+function getCurrentAgent(): string {
+  return loadFile(CURRENT_FILE) || "coding";
+}
+
+function setCurrentAgent(name: string): void {
+  fs.writeFileSync(CURRENT_FILE, name, "utf-8");
+}
+
+// ---------------------------------------------------------------------------
+// Agent system prompt assembly
+// ---------------------------------------------------------------------------
+
+function buildAgentSystemPrompt(config: AgentConfig): string {
+  const systemMd = loadFile(getAgentSystemPromptPath(config.name));
+  const parts: string[] = [];
+
+  // System prompt from system.md
+  if (systemMd) {
+    parts.push(systemMd);
+  }
+
+  // Goals
+  if (config.goals && config.goals.length > 0) {
+    parts.push("# Goals\n\n" + config.goals.map(g => `- ${g}`).join("\n"));
+  }
+
+  // Constraints
+  if (config.constraints && config.constraints.length > 0) {
+    parts.push("# Constraints\n\n" + config.constraints.map(c => `- ${c}`).join("\n"));
+  }
+
+  return parts.join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Migrate old modes/ → agents/
+// ---------------------------------------------------------------------------
+
+function migrateLegacyModes(): void {
+  if (fs.existsSync(AGENTS_DIR) && listAgents().length > 0) return;
+  if (!fs.existsSync(LEGACY_MODES_DIR)) return;
+
+  ensureDir(AGENTS_DIR);
+  const modes = fs.readdirSync(LEGACY_MODES_DIR).filter((f) =>
+    fs.statSync(path.join(LEGACY_MODES_DIR, f)).isDirectory()
   );
-}
 
-function listSkillsInDir(dir: string): string[] {
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).filter((f) => f.endsWith(".md"));
-}
+  for (const mode of modes) {
+    if (mode === "all") continue; // skip "all" base layer
+    const srcDir = path.join(LEGACY_MODES_DIR, mode);
+    const dstDir = path.join(AGENTS_DIR, mode);
 
-function listExtensionsInDir(dir: string): string[] {
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).filter((f) => f.endsWith(".ts") || f.endsWith(".js"));
+    if (fs.existsSync(dstDir)) continue;
+    fs.cpSync(srcDir, dstDir, { recursive: true });
+
+    // Create agent.yml if missing
+    if (!fs.existsSync(getAgentConfigPath(mode))) {
+      saveAgentConfig({
+        name: mode,
+        description: `Migrated from legacy mode: ${mode}`,
+      });
+    }
+
+    // Rename agents.md → system.md if needed
+    const agentsMd = path.join(dstDir, "agents.md");
+    const systemMd = path.join(dstDir, "system.md");
+    if (fs.existsSync(agentsMd) && !fs.existsSync(systemMd)) {
+      fs.renameSync(agentsMd, systemMd);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
-// State
+// Default agents
 // ---------------------------------------------------------------------------
 
-let currentMode = "coding";
-let allToolNames: string[] = [];
-let builtInToolNames: string[] = []; // tools from omp core (read, bash, edit, etc.)
+function ensureDefaultAgents(): void {
+  ensureDir(AGENTS_DIR);
 
-// ---------------------------------------------------------------------------
-// Mode-aware functions (exported via EventBus)
-// ---------------------------------------------------------------------------
+  if (!fs.existsSync(getAgentDir("coding"))) {
+    saveAgentConfig({
+      name: "coding",
+      description: "代码编写与调试",
+      thinking: "high",
+      tools: ["read", "write", "edit", "bash", "grep", "find", "ls", "lsp", "search", "task"],
+      goals: [
+        "编写高质量、可维护的代码",
+        "遵循项目现有风格和架构",
+        "在修改前充分理解上下文",
+      ],
+      constraints: [
+        "不要引入不必要的依赖",
+        "保持向后兼容",
+      ],
+    });
+    fs.writeFileSync(getAgentSystemPromptPath("coding"),
+      "# Coding Agent\n\nYou are an expert coding assistant. You write clean, maintainable code and follow project conventions.\n",
+      "utf-8"
+    );
+  }
 
-function getCurrentMode(): string { return currentMode; }
-function isActiveMode(modes: string[]): boolean { return modes.includes(currentMode); }
+  if (!fs.existsSync(getAgentDir("research"))) {
+    saveAgentConfig({
+      name: "research",
+      description: "代码研究与分析（只读）",
+      thinking: "medium",
+      tools: ["read", "grep", "find", "ls", "search", "lsp"],
+      goals: [
+        "深入理解代码结构和设计模式",
+        "提供准确、有依据的分析",
+      ],
+      constraints: [
+        "不要修改任何文件",
+        "只进行读取操作",
+      ],
+    });
+    fs.writeFileSync(getAgentSystemPromptPath("research"),
+      "# Research Agent\n\nYou are a code research assistant. You analyze codebases, explain architecture, and answer questions without making changes.\n",
+      "utf-8"
+    );
+  }
 
-/**
- * Check if an extension should be active based on its file path.
- * Hierarchy: global (always) → all (base) → current mode only
- */
-function isActiveForMode(extensionPath: string): boolean {
-  if (!extensionPath.includes("modes/")) return true;      // global
-  if (extensionPath.includes("modes/all/")) return true;   // base layer
-  if (extensionPath.includes(`modes/${currentMode}/`)) return true; // current
-  return false;                                             // other mode
+  if (!listAgents().includes(getCurrentAgent())) {
+    setCurrentAgent("coding");
+  }
 }
 
-/** Default tools per mode (empty = all tools) */
-const MODE_TOOLS: Record<string, string[]> = {
-  all: [],
-  coding: ["read", "write", "edit", "bash", "grep", "find", "ls"],
-  research: ["read", "grep", "find", "ls"],
-};
+// ---------------------------------------------------------------------------
+// Resolve thinking level
+// ---------------------------------------------------------------------------
 
-/** Compute allowed tools for current mode */
-function computeAllowedTools(): string[] {
-  const baseTools = MODE_TOOLS[currentMode];
-  if (!baseTools || baseTools.length === 0) return []; // empty = all
-  return baseTools;
+function resolveThinkingLevel(level: string | undefined): number | undefined {
+  if (!level) return undefined;
+  const map: Record<string, number> = {
+    off: 0,
+    minimal: 1,
+    low: 2,
+    medium: 3,
+    high: 4,
+    xhigh: 5,
+  };
+  return map[level.toLowerCase()];
 }
 
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
-export default function ompModeExtension(pi: ExtensionAPI) {
+export default function ompAgentExtension(pi: ExtensionAPI) {
+  const z = pi.zod;
+  let currentAgent = getCurrentAgent();
 
   // ── Startup ──────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
-    try {
-      allToolNames = ctx.getAllTools().map((t) => t.name);
-    } catch {
-      try {
-        allToolNames = ctx.getActiveTools();
-      } catch {
-        allToolNames = ["read", "write", "edit", "bash", "grep", "find", "ls"];
+    // Migrate legacy modes if needed
+    try { migrateLegacyModes(); } catch {}
+
+    // Ensure default agents exist
+    try { ensureDefaultAgents(); } catch {}
+
+    // Load current agent config
+    const config = loadAgentConfig(currentAgent);
+    if (!config) {
+      currentAgent = "coding";
+      setCurrentAgent("coding");
+    }
+
+    // Apply agent config
+    const cfg = loadAgentConfig(currentAgent);
+    if (cfg) {
+      // Set thinking level
+      const level = resolveThinkingLevel(cfg.thinking);
+      if (level !== undefined) {
+        try { pi.setThinkingLevel(level); } catch {}
+      }
+
+      // Set tools
+      if (cfg.tools && cfg.tools.length > 0) {
+        try { ctx.setActiveTools(cfg.tools); } catch {}
       }
     }
-    builtInToolNames = ["read", "write", "edit", "bash", "grep", "find", "ls"];
 
-    // Apply initial tool filter
-    const allowed = computeAllowedTools();
-    if (allowed.length > 0) {
-      try { ctx.setActiveTools(allowed); } catch {}
-    }
-
-    // Publish mode state for other extensions
-    pi.events.emit("mode_ready", { getCurrentMode, isActiveMode, isActiveForMode });
+    // Publish agent state for other extensions
+    pi.events.emit("agent_ready", {
+      getCurrentAgent: () => currentAgent,
+      getAgentConfig: loadAgentConfig,
+    });
   });
 
-  // ── System Prompt Processing ─────────────────────────────
+  // ── System Prompt Injection ─────────────────────────────
 
   pi.on("before_agent_start", async (event) => {
-    const agentsContent = loadFile(getModeAgentsFile(currentMode));
-    if (!agentsContent) return {};
+    const config = loadAgentConfig(currentAgent);
+    if (!config) return {};
 
-    let prompt = event.systemPrompt;
+    const agentPrompt = buildAgentSystemPrompt(config);
+    if (!agentPrompt) return {};
 
-    // Step 1: Remove extension_context from inactive modes
-    prompt = prompt.replace(
-      /<extension_context mode="([^"]*)">([\s\S]*?)<\/extension_context>/g,
-      (match, modesStr, content) => {
-        const modes = modesStr.split(",").map((m: string) => m.trim());
-        // Keep if: all, no mode specified, or includes current mode
-        if (modes.includes("all") || modes.includes(currentMode)) return match;
-        return ""; // Remove
-      }
-    );
+    // Prepend agent prompt to system prompt
+    const prompts = [...event.systemPrompt];
+    prompts.unshift(agentPrompt);
 
-    // Step 2: Split at "Available tools:" to replace role description
-    const toolsMarker = "Available tools:";
-    const toolsIndex = prompt.indexOf(toolsMarker);
-
-    if (toolsIndex === -1) {
-      return {
-        systemPrompt: prompt + `\n\n<mode_rules priority="override">\n${agentsContent}\n</mode_rules>`,
-      };
-    }
-
-    const beforeTools = prompt.substring(0, toolsIndex);
-    const afterTools = prompt.substring(toolsIndex);
-
-    // Step 3: Identify original role description vs injected content
-    const rolePatterns = [
-      /You are an expert coding assistant[\s\S]*?(?=\n\n|\n# )/,
-      /You are a[\s\S]*?operating inside omp[\s\S]*?(?=\n\n|\n# )/,
-    ];
-
-    let injectedByOthers = beforeTools;
-    for (const pattern of rolePatterns) {
-      const match = beforeTools.match(pattern);
-      if (match) {
-        injectedByOthers = beforeTools.substring(match.index! + match[0].length).trim();
-        break;
-      }
-    }
-
-    // Step 4: Filter skills — global + all (base) + current mode
-    const skills = event.systemPromptOptions.skills ?? [];
-    const filteredSkills = skills.filter((skill) => {
-      if (!skill.baseDir.includes("modes/")) return true;          // global
-      if (skill.baseDir.includes("modes/all/")) return true;       // base
-      if (currentMode !== "all" && skill.baseDir.includes(`modes/${currentMode}/`)) return true;
-      return false;
-    });
-
-    let skillsSection = "";
-    if (filteredSkills.length > 0) {
-      skillsSection = "\n\n<available_skills>\n";
-      for (const skill of filteredSkills) {
-        skillsSection += `<skill name="${skill.name}" description="${skill.description}" path="${skill.filePath}" />\n`;
-      }
-      skillsSection += "</available_skills>";
-    }
-
-    // Step 5: Extract date and cwd
-    const dateMatch = prompt.match(/Current date: .+/);
-    const cwdMatch = prompt.match(/Current working directory: .+/);
-    const meta = [dateMatch?.[0], cwdMatch?.[0]].filter(Boolean).join("\n");
-
-    // Step 6: Assemble final prompt
-    let newPrompt = agentsContent;
-    if (injectedByOthers) newPrompt += "\n\n" + injectedByOthers;
-    newPrompt += "\n\n" + afterTools;
-    if (skillsSection) {
-      if (newPrompt.includes("<available_skills>")) {
-        newPrompt = newPrompt.replace(/<available_skills>[\s\S]*?<\/available_skills>/, skillsSection);
-      } else {
-        newPrompt += skillsSection;
-      }
-    }
-    if (meta) newPrompt += "\n\n" + meta;
-
-    return { systemPrompt: newPrompt };
+    return { systemPrompt: prompts };
   });
 
-  // ── /mode Command ────────────────────────────────────────
+  // ── Switch Agent Logic ──────────────────────────────────
 
-  pi.registerCommand("mode", {
-    description: "Switch, list, or create agent modes",
-    argumentHint: "[mode-name | list | create <name>]",
+  async function switchAgent(
+    name: string,
+    ctx: ExtensionCommandContext,
+    clearHistory?: boolean,
+  ): Promise<boolean> {
+    const config = loadAgentConfig(name);
+    if (!config) {
+      ctx.ui.notify(`Agent "${name}" not found. Use /agent list to see available agents.`, "error");
+      return false;
+    }
+
+    const prevAgent = currentAgent;
+    currentAgent = name;
+    setCurrentAgent(name);
+
+    // Apply model
+    if (config.model) {
+      try {
+        const modelRegistry = ctx.modelRegistry;
+        // Try to find model by pattern
+        const models = modelRegistry.getAvailableModels?.() ?? [];
+        const match = models.find((m: { id: string }) =>
+          m.id === config.model || m.id.endsWith("/" + config.model)
+        );
+        if (match) {
+          await pi.setModel(match);
+        } else {
+          ctx.ui.notify(`Model "${config.model}" not found, keeping current model.`, "warning");
+        }
+      } catch {
+        ctx.ui.notify(`Failed to switch model to "${config.model}".`, "warning");
+      }
+    }
+
+    // Apply thinking level
+    const level = resolveThinkingLevel(config.thinking);
+    if (level !== undefined) {
+      try { pi.setThinkingLevel(level); } catch {}
+    }
+
+    // Apply tools
+    if (config.tools && config.tools.length > 0) {
+      try { await ctx.setActiveTools(config.tools); } catch {}
+    }
+
+    // Emit event
+    pi.events.emit("agent_changed", {
+      agent: name,
+      previousAgent: prevAgent,
+      config,
+    });
+
+    // Show summary
+    const modelStr = config.model || "current";
+    const thinkingStr = config.thinking || "current";
+    const toolsStr = config.tools ? `${config.tools.length} tools` : "all tools";
+    ctx.ui.notify(
+      `Switched to agent: ${ctx.ui.theme.fg("accent", name)} ` +
+      `(${modelStr}, ${thinkingStr}, ${toolsStr})`,
+      "success"
+    );
+
+    // Handle history
+    if (clearHistory) {
+      ctx.ui.notify("Starting new session with fresh history...", "info");
+      await ctx.newSession();
+    } else {
+      await ctx.reload();
+    }
+
+    return true;
+  }
+
+  // ── /agent Command ──────────────────────────────────────
+
+  pi.registerCommand("agent", {
+    description: "Switch, list, create, edit, or delete agents",
+    argumentHint: "[name | list | create <name> | edit | delete <name>]",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/);
       const action = parts[0]?.toLowerCase();
 
+      // No args → show current agent + list
       if (!action) {
-        const modes = listModes();
-        const lines = [`Current mode: ${ctx.ui.theme.bold(currentMode)}`, ""];
-        for (const mode of modes) {
-          const marker = mode === currentMode ? " ◀" : "";
-          const hasFile = fs.existsSync(getModeAgentsFile(mode));
-          const status = hasFile ? "" : ctx.ui.theme.fg("warning", " (no agents.md)");
-          lines.push(`  ${ctx.ui.theme.fg("accent", mode)}${status}${marker}`);
+        const agents = listAgents();
+        const config = loadAgentConfig(currentAgent);
+        const lines = [
+          `Current agent: ${ctx.ui.theme.bold(currentAgent)}`,
+          config?.description ? `  ${config.description}` : "",
+          config?.model ? `  Model: ${config.model}` : "",
+          config?.thinking ? `  Thinking: ${config.thinking}` : "",
+          config?.tools ? `  Tools: ${config.tools.join(", ")}` : "",
+          "",
+          "Available agents:",
+          "",
+        ];
+        for (const name of agents) {
+          const marker = name === currentAgent ? " ◀" : "";
+          const cfg = loadAgentConfig(name);
+          const desc = cfg?.description ? ` — ${cfg.description}` : "";
+          lines.push(`  ${ctx.ui.theme.fg("accent", name)}${desc}${marker}`);
         }
-        ctx.ui.notify(lines.join("\n"), "info");
+        ctx.ui.notify(lines.filter(Boolean).join("\n"), "info");
         return;
       }
 
+      // /agent list
       if (action === "list") {
-        const modes = listModes();
-        const lines = ["Available modes:", ""];
-        for (const mode of modes) {
-          const marker = mode === currentMode ? " ◀" : "";
-          const skillsCount = listSkillsInDir(getModeSkillsDir(mode)).length;
-          const extsCount = listExtensionsInDir(getModeExtensionsDir(mode)).length;
-          lines.push(`  ${ctx.ui.theme.fg("accent", mode)} — ${skillsCount} skills, ${extsCount} extensions${marker}`);
+        const agents = listAgents();
+        const lines = ["Available agents:", ""];
+        for (const name of agents) {
+          const cfg = loadAgentConfig(name);
+          const marker = name === currentAgent ? " ◀" : "";
+          const desc = cfg?.description || "";
+          const model = cfg?.model || "inherit";
+          const thinking = cfg?.thinking || "inherit";
+          const tools = cfg?.tools ? cfg.tools.length + " tools" : "all";
+          lines.push(`  ${ctx.ui.theme.fg("accent", name)}${marker}`);
+          lines.push(`    ${desc}`);
+          lines.push(`    model: ${model} | thinking: ${thinking} | tools: ${tools}`);
         }
         ctx.ui.notify(lines.join("\n"), "info");
         return;
       }
 
+      // /agent create <name>
       if (action === "create") {
         const name = parts[1]?.toLowerCase();
-        if (!name) { ctx.ui.notify("Usage: /mode create <name>", "error"); return; }
-        if (listModes().includes(name)) { ctx.ui.notify(`Mode "${name}" already exists`, "error"); return; }
+        if (!name) {
+          ctx.ui.notify("Usage: /agent create <name>", "error");
+          return;
+        }
+        if (listAgents().includes(name)) {
+          ctx.ui.notify(`Agent "${name}" already exists.`, "error");
+          return;
+        }
 
-        const modeDir = getModeDir(name);
-        ensureDir(modeDir);
-        ensureDir(getModeSkillsDir(name));
-        ensureDir(getModeExtensionsDir(name));
-        fs.writeFileSync(getModeAgentsFile(name),
-          `# ${name} Mode\n\nYou are a helpful assistant operating inside omp.\n\n# Guidelines\n\n- Be concise\n- Follow user instructions\n`,
+        // Interactive setup
+        const description = await ctx.ui.input("Agent description:", "A helpful assistant") ?? "";
+        const model = await ctx.ui.input("Model (empty for inherit):", "") ?? "";
+        const thinking = await ctx.ui.select("Thinking level:", [
+          "inherit", "minimal", "low", "medium", "high", "xhigh",
+        ]) ?? "inherit";
+
+        const config: AgentConfig = {
+          name,
+          description: description || undefined,
+          model: model || undefined,
+          thinking: thinking === "inherit" ? undefined : thinking,
+          tools: undefined, // inherit all
+          goals: [],
+          constraints: [],
+        };
+
+        saveAgentConfig(config);
+        fs.writeFileSync(getAgentSystemPromptPath(name),
+          `# ${name} Agent\n\nYou are a helpful assistant.\n`,
           "utf-8"
         );
-        ctx.ui.notify(`Created mode "${name}" at ${modeDir}`, "success");
-        ctx.ui.notify(`Edit ${getModeAgentsFile(name)} to customize`, "info");
+
+        ctx.ui.notify(`Created agent "${name}" at ${getAgentDir(name)}`, "success");
+        ctx.ui.notify(`Edit ${getAgentConfigPath(name)} to customize.`, "info");
         return;
       }
 
-      // Switch mode
-      const target = action;
-      if (!listModes().includes(target)) {
-        ctx.ui.notify(`Unknown mode: "${target}". Use /mode list to see available modes.`, "error");
+      // /agent edit
+      if (action === "edit") {
+        const configPath = getAgentConfigPath(currentAgent);
+        const systemPath = getAgentSystemPromptPath(currentAgent);
+        ctx.ui.notify(`Config: ${configPath}`, "info");
+        ctx.ui.notify(`Prompt: ${systemPath}`, "info");
         return;
       }
 
-      currentMode = target;
+      // /agent delete <name>
+      if (action === "delete") {
+        const name = parts[1]?.toLowerCase();
+        if (!name) {
+          ctx.ui.notify("Usage: /agent delete <name>", "error");
+          return;
+        }
+        if (name === currentAgent) {
+          ctx.ui.notify("Cannot delete the active agent.", "error");
+          return;
+        }
+        if (!listAgents().includes(name)) {
+          ctx.ui.notify(`Agent "${name}" not found.`, "error");
+          return;
+        }
 
-      // Filter tools for new mode
-      const allowed = computeAllowedTools();
-      if (allowed.length > 0) {
-        try { ctx.setActiveTools(allowed); } catch {}
+        const confirmed = await ctx.ui.confirm("Delete agent", `Delete agent "${name}" and all its files?`);
+        if (confirmed) {
+          deleteAgent(name);
+          ctx.ui.notify(`Deleted agent "${name}".`, "success");
+        }
+        return;
       }
 
-      // Emit mode_changed event for other extensions
-      pi.events.emit("mode_changed", { mode: currentMode, getCurrentMode, isActiveMode, isActiveForMode });
+      // /agent switch <name> — or just /agent <name>
+      const target = action === "switch" ? (parts[1]?.toLowerCase() ?? "") : action;
+      if (!target) {
+        ctx.ui.notify("Usage: /agent switch <name> or /agent <name>", "error");
+        return;
+      }
 
-      const skillsCount = listSkillsInDir(getModeSkillsDir(target)).length;
-      const extsCount = listExtensionsInDir(getModeExtensionsDir(target)).length;
-      ctx.ui.notify(`Switched to mode: ${ctx.ui.theme.fg("accent", target)} (${skillsCount} skills, ${extsCount} extensions)`, "success");
+      if (!listAgents().includes(target)) {
+        ctx.ui.notify(`Agent "${target}" not found. Use /agent list to see available agents.`, "error");
+        return;
+      }
 
-      // Reload to apply new system prompt
-      ctx.reload();
+      if (target === currentAgent) {
+        ctx.ui.notify(`Already on agent "${target}".`, "info");
+        return;
+      }
+
+      // Show agent summary and ask about history
+      const config = loadAgentConfig(target);
+      const summary = [
+        `Agent: ${target}`,
+        config?.description ? `  ${config.description}` : "",
+        config?.model ? `  Model: ${config.model}` : "",
+        config?.thinking ? `  Thinking: ${config.thinking}` : "",
+        config?.tools ? `  Tools: ${config.tools.join(", ")}` : "",
+      ].filter(Boolean).join("\n");
+
+      ctx.ui.notify(summary, "info");
+      const clearHistory = await ctx.ui.confirm("Switch agent", "Clear conversation history?");
+
+      await switchAgent(target, ctx, clearHistory ?? false);
     },
   });
 
-  // ── Tools ────────────────────────────────────────────────
-
-  const z = pi.zod;
+  // ── Tools (for LLM) ─────────────────────────────────────
 
   pi.registerTool({
-    name: "mode_list",
-    label: "List Modes",
-    description: "List all available agent modes.",
+    name: "agent_list",
+    label: "List Agents",
+    description: "List all available agents with their configurations.",
     parameters: z.object({}),
+    approval: "read" as const,
     async execute() {
-      const modes = listModes();
-      const lines = modes.map(m => {
-        const marker = m === currentMode ? " (current)" : "";
-        const skillsCount = listSkillsInDir(getModeSkillsDir(m)).length;
-        const extsCount = listExtensionsInDir(getModeExtensionsDir(m)).length;
-        return `- ${m}${marker} — ${skillsCount} skills, ${extsCount} extensions`;
+      const agents = listAgents();
+      const lines = agents.map(name => {
+        const cfg = loadAgentConfig(name);
+        const marker = name === currentAgent ? " (current)" : "";
+        const desc = cfg?.description || "";
+        const model = cfg?.model || "inherit";
+        const thinking = cfg?.thinking || "inherit";
+        const tools = cfg?.tools ? cfg.tools.join(", ") : "all";
+        return `- ${name}${marker}: ${desc}\n  model: ${model} | thinking: ${thinking} | tools: ${tools}`;
       });
-      return { content: [{ type: "text", text: `Available modes:\n${lines.join("\n")}` }] };
+      return { content: [{ type: "text", text: `Available agents:\n${lines.join("\n")}` }] };
     },
   });
 
   pi.registerTool({
-    name: "mode_switch",
-    label: "Switch Mode",
-    description: "Switch to a different agent mode.",
+    name: "agent_switch",
+    label: "Switch Agent",
+    description: "Switch to a different agent. Changes model, thinking level, tools, and system prompt.",
     parameters: z.object({
-      mode: z.string().describe("Mode name to switch to."),
+      agent: z.string().describe("Agent name to switch to."),
+      clear_history: z.boolean().optional().describe("If true, start a fresh session without conversation history."),
     }),
-    async execute(_id, params) {
-      if (!listModes().includes(params.mode)) {
-        return { content: [{ type: "text", text: `Unknown mode: "${params.mode}". Use mode_list to see available modes.` }] };
+    approval: "write" as const,
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!listAgents().includes(params.agent)) {
+        return { content: [{ type: "text", text: `Agent "${params.agent}" not found. Use agent_list to see available agents.` }] };
       }
-      currentMode = params.mode;
-      const allowed = computeAllowedTools();
-      if (allowed.length > 0) {
-        try { /* ctx.setActiveTools(allowed); */ } catch {}
+      if (params.agent === currentAgent) {
+        return { content: [{ type: "text", text: `Already on agent "${params.agent}".` }] };
       }
-      pi.events.emit("mode_changed", { mode: currentMode, getCurrentMode, isActiveMode, isActiveForMode });
-      return { content: [{ type: "text", text: `Switched to mode: ${params.mode}` }] };
+
+      // Note: tools can't call ctx.newSession(), so clear_history is ignored when called from LLM
+      const config = loadAgentConfig(params.agent)!;
+      const prev = currentAgent;
+      currentAgent = params.agent;
+      setCurrentAgent(params.agent);
+
+      // Apply config
+      if (config.thinking) {
+        const level = resolveThinkingLevel(config.thinking);
+        if (level !== undefined) {
+          try { pi.setThinkingLevel(level); } catch {}
+        }
+      }
+      if (config.tools && config.tools.length > 0) {
+        try { await ctx.setActiveTools(config.tools); } catch {}
+      }
+
+      pi.events.emit("agent_changed", { agent: params.agent, previousAgent: prev, config });
+
+      const modelStr = config.model || "current";
+      const thinkingStr = config.thinking || "current";
+      const toolsStr = config.tools ? `${config.tools.length} tools` : "all tools";
+      return {
+        content: [{
+          type: "text",
+          text: `Switched to agent "${params.agent}" (${modelStr}, ${thinkingStr}, ${toolsStr}). ` +
+            `System prompt will update on the next turn.`,
+        }],
+      };
     },
   });
 
   pi.registerTool({
-    name: "mode_create",
-    label: "Create Mode",
-    description: "Create a new agent mode.",
+    name: "agent_create",
+    label: "Create Agent",
+    description: "Create a new agent with a custom configuration.",
     parameters: z.object({
-      name: z.string().describe("Mode name (lowercase, e.g. 'research', 'writing')."),
-      description: z.string().optional().describe("Mode description."),
+      name: z.string().describe("Agent name (lowercase, e.g. 'writer', 'devops')."),
+      description: z.string().optional().describe("Short description of the agent's purpose."),
+      model: z.string().optional().describe("Model ID (e.g. 'anthropic/claude-sonnet-4-6'). Omit to inherit."),
+      thinking: z.string().optional().describe("Thinking level: off, minimal, low, medium, high, xhigh. Omit to inherit."),
+      tools: z.array(z.string()).optional().describe("List of allowed tool names. Omit for all tools."),
+      system_prompt: z.string().optional().describe("System prompt content (written to system.md)."),
     }),
+    approval: "write" as const,
     async execute(_id, params) {
       const name = params.name.toLowerCase();
-      if (listModes().includes(name)) {
-        return { content: [{ type: "text", text: `Mode "${name}" already exists.` }] };
+      if (listAgents().includes(name)) {
+        return { content: [{ type: "text", text: `Agent "${name}" already exists.` }] };
       }
 
-      const modeDir = getModeDir(name);
-      ensureDir(modeDir);
-      ensureDir(getModeSkillsDir(name));
-      ensureDir(getModeExtensionsDir(name));
+      const config: AgentConfig = {
+        name,
+        description: params.description,
+        model: params.model,
+        thinking: params.thinking,
+        tools: params.tools,
+        goals: [],
+        constraints: [],
+      };
 
-      const description = params.description || `You are a helpful assistant in ${name} mode.`;
-      fs.writeFileSync(getModeAgentsFile(name),
-        `# ${name} Mode\n\n${description}\n\n# Guidelines\n\n- Be concise\n- Follow user instructions\n`,
-        "utf-8"
-      );
+      saveAgentConfig(config);
 
-      return { content: [{ type: "text", text: `Created mode "${name}" at ${modeDir}\nEdit ${getModeAgentsFile(name)} to customize.` }] };
+      if (params.system_prompt) {
+        fs.writeFileSync(getAgentSystemPromptPath(name), params.system_prompt, "utf-8");
+      } else {
+        fs.writeFileSync(getAgentSystemPromptPath(name),
+          `# ${name} Agent\n\nYou are a helpful assistant.\n`,
+          "utf-8"
+        );
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: `Created agent "${name}" at ${getAgentDir(name)}\n` +
+            `Config: ${getAgentConfigPath(name)}\n` +
+            `Prompt: ${getAgentSystemPromptPath(name)}`,
+        }],
+      };
     },
   });
 
   // ── Exports for other extensions ──────────────────────────
 
-  // Export mode functions via EventBus for other extensions
-  pi.events.emit("mode_exports", {
-    getCurrentMode,
-    isActiveMode,
-    isActiveForMode,
+  pi.events.emit("agent_exports", {
+    getCurrentAgent: () => currentAgent,
+    getAgentConfig: loadAgentConfig,
+    switchAgent: (name: string) => {
+      const config = loadAgentConfig(name);
+      if (config) {
+        currentAgent = name;
+        setCurrentAgent(name);
+        pi.events.emit("agent_changed", { agent: name, config });
+      }
+    },
   });
 }
