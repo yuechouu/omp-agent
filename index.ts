@@ -381,6 +381,20 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
     });
   });
 
+  // ── Skills Isolation ───────────────────────────────────
+
+  pi.on("resources_discover", () => {
+    const globalSkillsDir = path.join(OMP_DIR, "skills");
+    const agentSkillsDir = getAgentSkillsDir(currentAgent);
+    const globalExtensionsDir = path.join(OMP_DIR, "extensions");
+    const agentExtensionsDir = getAgentExtensionsDir(currentAgent);
+
+    return {
+      skillPaths: [globalSkillsDir, agentSkillsDir],
+      promptPaths: [],
+    };
+  });
+
   // ── System Prompt Injection ─────────────────────────────
 
   pi.on("before_agent_start", async (event) => {
@@ -443,6 +457,13 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
     if (config.tools && config.tools.length > 0) {
       try { await ctx.setActiveTools(config.tools); } catch {}
     }
+
+    // Reload extensions for agent isolation
+    try {
+      const globalExtensionsDir = path.join(OMP_DIR, "extensions");
+      const agentExtensionsDir = getAgentExtensionsDir(name);
+      await pi.reloadExtensions([globalExtensionsDir, agentExtensionsDir]);
+    } catch {}
 
     // Emit event
     pi.events.emit("agent_changed", {
