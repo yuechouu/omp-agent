@@ -448,16 +448,22 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
 
   // ── System Prompt Injection ─────────────────────────────
 
+  // Load base prompt (technical rules) from bundled file
+  const basePromptPath = path.join(__dirname, "base-prompt.md");
+  let basePrompt = "";
+  try { basePrompt = fs.readFileSync(basePromptPath, "utf-8").trim(); } catch {}
+
   pi.on("before_agent_start", async (event) => {
     const config = loadAgentConfig(currentAgent);
     if (!config) return {};
 
     const agentPrompt = buildAgentSystemPrompt(config);
-    if (!agentPrompt) return {};
+    if (!agentPrompt && !basePrompt) return {};
 
-    // Prepend agent prompt, keep full default prompt after
-    const prompts = [agentPrompt, ...event.systemPrompt];
-    return { systemPrompt: prompts };
+    // Agent prompt (role + goals + constraints) + base prompt (technical rules)
+    // Skip omp's default prompt entirely
+    const parts = [agentPrompt, basePrompt].filter(Boolean);
+    return { systemPrompt: parts };
   });
 
   // ── Switch Agent Logic ──────────────────────────────────

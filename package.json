@@ -1,8 +1,12 @@
 {
   "name": "@yuechou/omp-agent",
-  "version": "1.0.7",
+  "version": "1.0.9",
   "description": "Oh My Pi multi-agent management extension",
   "main": "index.ts",
+  "files": [
+    "index.ts",
+    "base-prompt.md"
+  ],
   "keywords": [
     "omp-extension",
     "agent",
@@ -20,6 +24,6 @@
     ]
   },
   "dependencies": {
-    "@yuechou/omp-agent": "^1.0.7"
+    "@yuechou/omp-agent": "^1.0.9"
   }
 }
