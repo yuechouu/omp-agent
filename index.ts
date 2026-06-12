@@ -455,11 +455,23 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
     const agentPrompt = buildAgentSystemPrompt(config);
     if (!agentPrompt) return {};
 
-    // Prepend agent prompt to system prompt
-    const prompts = [...event.systemPrompt];
-    prompts.unshift(agentPrompt);
+    // Extract functional parts from original prompt (tools, date, cwd)
+    const original = event.systemPrompt.join("\n");
+    const functional: string[] = [];
 
-    return { systemPrompt: prompts };
+    // Keep "Available tools:" section
+    const toolsMatch = original.match(/Available tools:[\s\S]*?(?=\n\n#|\n\nCurrent date|$)/);
+    if (toolsMatch) functional.push(toolsMatch[0].trim());
+
+    // Keep current date and cwd
+    const dateMatch = original.match(/Current date: .+/);
+    const cwdMatch = original.match(/Current working directory: .+/);
+    if (dateMatch) functional.push(dateMatch[0]);
+    if (cwdMatch) functional.push(cwdMatch[0]);
+
+    // Agent prompt as main body, functional parts appended
+    const result = [agentPrompt, ...functional];
+    return { systemPrompt: result };
   });
 
   // ── Switch Agent Logic ──────────────────────────────────
