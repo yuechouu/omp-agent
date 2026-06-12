@@ -35,6 +35,8 @@ interface AgentConfig {
   model?: string;
   thinking?: string;
   tools?: string[];
+  skills?: string[];       // ["global", "@yuechou/omp-memory"] — filter which skills are visible
+  extensions?: string[];   // ["global", "@yuechou/omp-memory"] — filter which extensions are loaded
   goals?: string[];
   constraints?: string[];
 }
@@ -147,6 +149,8 @@ function loadAgentConfig(name: string): AgentConfig | null {
     model: raw.model as string | undefined,
     thinking: raw.thinking as string | undefined,
     tools: raw.tools as string[] | undefined,
+    skills: raw.skills as string[] | undefined,
+    extensions: raw.extensions as string[] | undefined,
     goals: raw.goals as string[] | undefined,
     constraints: raw.constraints as string[] | undefined,
   };
@@ -163,6 +167,14 @@ function saveAgentConfig(config: AgentConfig): void {
   if (config.tools && config.tools.length > 0) {
     lines.push("tools:");
     for (const t of config.tools) lines.push(`  - ${t}`);
+  }
+  if (config.skills && config.skills.length > 0) {
+    lines.push("skills:");
+    for (const s of config.skills) lines.push(`  - ${s}`);
+  }
+  if (config.extensions && config.extensions.length > 0) {
+    lines.push("extensions:");
+    for (const e of config.extensions) lines.push(`  - ${e}`);
   }
   if (config.goals && config.goals.length > 0) {
     lines.push("goals:");
@@ -182,6 +194,24 @@ function listAgents(): string[] {
     const full = path.join(AGENTS_DIR, f);
     return fs.statSync(full).isDirectory() && !f.startsWith(".");
   });
+}
+
+function listPlugins(): string[] {
+  const pluginsDir = path.join(OMP_DIR, "plugins", "node_modules");
+  if (!fs.existsSync(pluginsDir)) return [];
+  const scopes = fs.readdirSync(pluginsDir);
+  const plugins: string[] = [];
+  for (const scope of scopes) {
+    if (scope.startsWith("@")) {
+      const scopeDir = path.join(pluginsDir, scope);
+      for (const pkg of fs.readdirSync(scopeDir)) {
+        plugins.push(`${scope}/${pkg}`);
+      }
+    } else {
+      plugins.push(scope);
+    }
+  }
+  return plugins;
 }
 
 function deleteAgent(name: string): boolean {
@@ -276,6 +306,8 @@ function ensureDefaultAgents(): void {
       description: "代码编写与调试",
       thinking: "high",
       tools: ["read", "write", "edit", "bash", "grep", "find", "ls", "lsp", "search", "task"],
+      skills: ["global"],
+      extensions: ["global"],
       goals: [
         "编写高质量、可维护的代码",
         "遵循项目现有风格和架构",
@@ -298,6 +330,8 @@ function ensureDefaultAgents(): void {
       description: "代码研究与分析（只读）",
       thinking: "medium",
       tools: ["read", "grep", "find", "ls", "search", "lsp"],
+      skills: ["global"],
+      extensions: ["global"],
       goals: [
         "深入理解代码结构和设计模式",
         "提供准确、有依据的分析",
@@ -384,15 +418,32 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
   // ── Skills Isolation ───────────────────────────────────
 
   pi.on("resources_discover", () => {
-    const globalSkillsDir = path.join(OMP_DIR, "skills");
-    const agentSkillsDir = getAgentSkillsDir(currentAgent);
-    const globalExtensionsDir = path.join(OMP_DIR, "extensions");
-    const agentExtensionsDir = getAgentExtensionsDir(currentAgent);
+    const config = loadAgentConfig(currentAgent);
+    const skillPaths: string[] = [];
 
-    return {
-      skillPaths: [globalSkillsDir, agentSkillsDir],
-      promptPaths: [],
-    };
+    // If no skills filter → include everything
+    if (!config?.skills || config.skills.length === 0) {
+      skillPaths.push(
+        path.join(OMP_DIR, "skills"),
+        getAgentSkillsDir(currentAgent),
+      );
+    } else {
+      for (const entry of config.skills) {
+        if (entry === "global") {
+          skillPaths.push(path.join(OMP_DIR, "skills"));
+        } else {
+          // Plugin name → look for skills in plugin directory
+          const pluginSkillsDir = path.join(OMP_DIR, "plugins", "node_modules", entry, "skills");
+          if (fs.existsSync(pluginSkillsDir)) {
+            skillPaths.push(pluginSkillsDir);
+          }
+        }
+      }
+      // Always include agent's own skills
+      skillPaths.push(getAgentSkillsDir(currentAgent));
+    }
+
+    return { skillPaths };
   });
 
   // ── System Prompt Injection ─────────────────────────────
@@ -460,9 +511,36 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
 
     // Reload extensions for agent isolation
     try {
-      const globalExtensionsDir = path.join(OMP_DIR, "extensions");
-      const agentExtensionsDir = getAgentExtensionsDir(name);
-      await pi.reloadExtensions([globalExtensionsDir, agentExtensionsDir]);
+      const extensionPaths: string[] = [];
+
+      if (!config.extensions || config.extensions.length === 0) {
+        // No filter → include everything
+        extensionPaths.push(
+          path.join(OMP_DIR, "extensions"),
+          getAgentExtensionsDir(name),
+        );
+      } else {
+        for (const entry of config.extensions) {
+          if (entry === "global") {
+            extensionPaths.push(path.join(OMP_DIR, "extensions"));
+          } else {
+            // Plugin name → look for extension entry in plugin
+            const pluginDir = path.join(OMP_DIR, "plugins", "node_modules", entry);
+            if (fs.existsSync(pluginDir)) {
+              const pluginPkg = path.join(pluginDir, "package.json");
+              try {
+                const pkg = JSON.parse(fs.readFileSync(pluginPkg, "utf-8"));
+                const ext = pkg.omp?.extensions?.[0] || pkg.main || "index.ts";
+                extensionPaths.push(path.join(pluginDir, ext));
+              } catch {}
+            }
+          }
+        }
+        // Always include agent's own extensions
+        extensionPaths.push(getAgentExtensionsDir(name));
+      }
+
+      await pi.reloadExtensions(extensionPaths);
     } catch {}
 
     // Emit event
@@ -618,6 +696,22 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
         }
       }
 
+      // Step 6: Skills & Extensions
+      const plugins = listPlugins();
+      const skillOptions = [
+        { label: "global", description: "All global skills" },
+        ...plugins.map(p => ({ label: p, description: `Skills from ${p}` })),
+      ];
+      const selectedSkills = await ctx.ui.select("Skills (global = all):", skillOptions);
+      const skills = selectedSkills ? [selectedSkills] : ["global"];
+
+      const extOptions = [
+        { label: "global", description: "All global extensions" },
+        ...plugins.map(p => ({ label: p, description: `Extension from ${p}` })),
+      ];
+      const selectedExts = await ctx.ui.select("Extensions (global = all):", extOptions);
+      const extensions = selectedExts ? [selectedExts] : ["global"];
+
       // Create agent
       const config: AgentConfig = {
         name: normalizedName,
@@ -625,6 +719,8 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
         model: model === "(inherit)" ? undefined : model,
         thinking: thinking === "(inherit)" ? undefined : thinking,
         tools,
+        skills,
+        extensions,
         goals: [],
         constraints: [],
       };
@@ -717,7 +813,9 @@ export default function ompAgentExtension(pi: ExtensionAPI) {
         const model = cfg?.model || "inherit";
         const thinking = cfg?.thinking || "inherit";
         const tools = cfg?.tools ? cfg.tools.join(", ") : "all";
-        return `- ${name}${marker}: ${desc}\n  model: ${model} | thinking: ${thinking} | tools: ${tools}`;
+        const skills = cfg?.skills ? cfg.skills.join(", ") : "all";
+        const extensions = cfg?.extensions ? cfg.extensions.join(", ") : "all";
+        return `- ${name}${marker}: ${desc}\n  model: ${model} | thinking: ${thinking} | tools: ${tools}\n  skills: ${skills} | extensions: ${extensions}`;
       });
       return { content: [{ type: "text", text: `Available agents:\n${lines.join("\n")}` }] };
     },
